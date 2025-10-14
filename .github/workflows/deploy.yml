@@ -1,0 +1,195 @@
+name: Deploy Lambda Tool
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install deployment tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 wheel
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-north-1
+
+      - name: Prepare Lambda Function
+        run: |
+          set -e
+          
+          FUNC_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2 | sed 's/[^a-zA-Z0-9_-]/_/g')
+          
+          echo "📁 Preparing deployment for: $FUNC_NAME"
+          
+          # Create build directory
+          mkdir -p build
+          
+          # Combine user code (tool.py) with lambda handler
+          echo "🔧 Merging user code with Lambda handler..."
+          
+          cat tool.py > build/lambda_function.py
+          
+          # Append separator and lambda handler
+          cat >> build/lambda_function.py << 'HANDLER_EOF'
+
+# --------------
+
+import json
+import inspect
+
+def lambda_handler(event, context):
+    """
+    AWS Lambda handler function
+    This is auto-generated and appended during deployment.
+    DO NOT modify this in your repository.
+    """
+    try:
+        body = event.get("body", {})
+        if isinstance(body, str):
+            body = json.loads(body)
+
+        # Find all callable functions except lambda_handler
+        funcs = [v for k, v in globals().items() if callable(v) and k != 'lambda_handler']
+
+        if not funcs:
+            return {
+                "statusCode": 500,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*"
+                },
+                "body": json.dumps({"error": "No callable function found"})
+            }
+
+        # Use the last defined function (typically 'main')
+        func = funcs[-1]
+        sig = inspect.signature(func)
+        args = {k: body[k] for k in sig.parameters if k in body}
+
+        result = func(**args)
+        
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps(result)
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            })
+        }
+HANDLER_EOF
+          
+          echo "✅ Lambda function created successfully"
+          
+          # Install dependencies if requirements.txt exists
+          if [[ -s requirements.txt ]]; then
+            echo "📦 Installing dependencies for $FUNC_NAME"
+            pip install -r requirements.txt -t build/
+          else
+            echo "⚠️ No requirements.txt found"
+          fi
+          
+          echo "📂 Build directory contents:"
+          ls -la build/
+
+      - name: Deploy to Lambda
+        run: |
+          set -e
+          
+          FUNC_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2 | sed 's/[^a-zA-Z0-9_-]/_/g')
+          
+          echo "📦 Creating deployment package for $FUNC_NAME"
+          
+          # Create zip file from build directory
+          cd build
+          zip -r "../${FUNC_NAME}.zip" . > /dev/null
+          cd ..
+          
+          echo "🚀 Deploying $FUNC_NAME to Lambda..."
+          
+          # Check if function exists
+          if aws lambda get-function --function-name "$FUNC_NAME" > /dev/null 2>&1; then
+            echo "🔄 Updating existing function $FUNC_NAME"
+            
+            # Update function code with retry
+            max_retries=5
+            attempt=1
+            while [ $attempt -le $max_retries ]; do
+              if aws lambda update-function-code \
+                  --function-name "$FUNC_NAME" \
+                  --zip-file fileb://"${FUNC_NAME}.zip"; then
+                echo "✅ Code updated successfully"
+                
+                # Wait for update to complete
+                sleep 5
+                
+                # Update environment variables
+                aws lambda update-function-configuration \
+                  --function-name "$FUNC_NAME" \
+                  --environment "Variables={ENV=prod,TOOL_SECRET=${{ secrets.TOOL_SECRET }}}" \
+                  --timeout 60 \
+                  --memory-size 256
+                
+                echo "✅ Successfully updated $FUNC_NAME"
+                break
+              else
+                echo "⚠️ Update failed (attempt $attempt), retrying in 10s..."
+                sleep 10
+              fi
+              attempt=$((attempt + 1))
+            done
+            
+          else
+            echo "🆕 Creating new function $FUNC_NAME"
+            aws lambda create-function \
+              --function-name "$FUNC_NAME" \
+              --runtime python3.11 \
+              --role arn:aws:iam::851725561714:role/Python_lambda \
+              --handler lambda_function.lambda_handler \
+              --zip-file fileb://"${FUNC_NAME}.zip" \
+              --timeout 60 \
+              --memory-size 256 \
+              --environment "Variables={ENV=prod,TOOL_SECRET=${{ secrets.TOOL_SECRET }}}" || {
+                echo "❌ Failed to create function $FUNC_NAME"
+                exit 1
+              }
+          fi
+          
+          echo "✅ Successfully deployed $FUNC_NAME"
+          echo "📊 Function details:"
+          aws lambda get-function --function-name "$FUNC_NAME" --query 'Configuration.[FunctionName,FunctionArn,Runtime,Handler,MemorySize,Timeout]' --output table
